@@ -18,19 +18,39 @@ import logging
 import os
 import argparse
 
-# Get the directory where the script is located
-script_dir = os.path.dirname(os.path.abspath(__file__))
+def detect_printer_type(gcode_lines):
+    """Detect printer type based on G-code features"""
+    logging.info("Starting printer type detection")
+    
+    for i, line in enumerate(gcode_lines):
+        if "; FEATURE:" in line:
+            logging.info(f"Detected Bambu/Orca printer from feature marker in line {i}: {line.strip()}")
+            return "bambu"
+        elif ";TYPE:" in line:
+            logging.info(f"Detected Prusa printer from type marker in line {i}: {line.strip()}")
+            return "prusa"
+    
+    logging.warning("No printer type markers found - defaulting to Prusa")
+    return "prusa"
 
-# Configure logging to save in the script's directory
-log_file_path = os.path.join(script_dir, "z_shift_log.txt")
-logging.basicConfig(
-    filename=log_file_path,
-    filemode="w",
-    level=logging.INFO,  # Changed to INFO level
-    format="%(asctime)s - %(message)s"  # Simplified format
-)
+def get_z_height_from_comment(line):
+    """Extract Z height from comment if present"""
+    if "; Z_HEIGHT:" in line:
+        match = re.search(r'; Z_HEIGHT: ([\d.]+)', line)
+        if match:
+            return float(match.group(1))
+    return None
 
 def process_gcode(input_file, layer_height, extrusion_multiplier):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_file_path = os.path.join(script_dir, "z_shift_log.txt")
+    logging.basicConfig(
+        filename=log_file_path,
+        filemode="w",
+        level=logging.INFO,
+        format="%(asctime)s - %(message)s"
+    )
+
     current_layer = 0
     current_z = 0.0
     perimeter_type = None
@@ -42,91 +62,87 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
     logging.info("Starting G-code processing")
     logging.info(f"Settings: Layer height={layer_height}mm, Z-shift={z_shift}mm, Extrusion multiplier={extrusion_multiplier}")
 
-    # Read the input G-code
     with open(input_file, 'r') as infile:
         lines = infile.readlines()
 
-    # First pass: analyze the file structure
-    feature_types = set()
-    for line in lines:
-        if "; FEATURE:" in line:
-            feature_types.add(line.strip())
-    if feature_types:
-        logging.info(f"Detected features: {', '.join(feature_types)}")
+    printer_type = detect_printer_type(lines)
+    logging.info(f"Detected printer type: {printer_type}")
 
-    # Identify the total number of layers
-    total_layers = sum(1 for line in lines if line.startswith("G1 Z"))
-    logging.info(f"Total layers: {total_layers}")
-
-    # Process the G-code
     modified_lines = []
-    shifted_blocks = 0  # Counter for shifted blocks
+    shifted_blocks = 0
+    in_object = False  # Track if we're inside an object printing section
     
     for line_num, line in enumerate(lines):
-        # Detect layer changes
-        if line.startswith("G1 Z"):
-            z_match = re.search(r'Z([-\d.]+)', line)
-            if z_match:
-                current_z = float(z_match.group(1))
-                current_layer = int(current_z / layer_height)
-                perimeter_block_count = 0
-            modified_lines.append(line)
-            continue
-
-        # Detect perimeter types from comments
-        if "; FEATURE: Outer wall" in line:
-            perimeter_type = "external"
-            inside_perimeter_block = False
-        elif "; FEATURE: Inner wall" in line:
-            perimeter_type = "internal"
-            inside_perimeter_block = False
-            perimeter_found = True
-        elif "; FEATURE:" in line:
-            perimeter_type = None
-            inside_perimeter_block = False
-
-        # Group lines into perimeter blocks
-        if perimeter_type == "internal" and line.startswith("G1") and "X" in line and "Y" in line:
-            if "E" in line:  # Extrusion move
-                # Start a new perimeter block if not already inside one
-                if not inside_perimeter_block:
-                    perimeter_block_count += 1
-                    inside_perimeter_block = True
-                    is_shifted = perimeter_block_count % 2 == 1
-
-                    if is_shifted:  # Apply Z-shift to odd-numbered blocks
-                        shifted_blocks += 1
-                        adjusted_z = current_z + z_shift
-                        modified_lines.append(f"G1 Z{adjusted_z:.3f} ; Shifted Z for block #{perimeter_block_count}\n")
-                    else:  # Reset to the true layer height for even-numbered blocks
-                        modified_lines.append(f"G1 Z{current_z:.3f} ; Reset Z for block #{perimeter_block_count}\n")
-
-                # Adjust extrusion for shifted blocks
-                if is_shifted:
-                    e_match = re.search(r'E([-\d.]+)', line)
-                    if e_match:
-                        e_value = float(e_match.group(1))
-                        if current_layer == 0:
-                            new_e_value = e_value * 1.5
-                        elif current_layer == total_layers - 1:
-                            new_e_value = e_value * 0.5
-                        else:
-                            new_e_value = e_value * extrusion_multiplier
-                        
-                        line = re.sub(r'E[-\d.]+', f'E{new_e_value:.5f}', line.strip())
-                        line += f" ; Adjusted E for block #{perimeter_block_count}\n"
-
-            elif "F" in line and not "E" in line:  # Move without extrusion - end of block
+        # Track object printing sections
+        if "M624" in line:  # Start printing object
+            in_object = True
+            perimeter_block_count = 0  # Reset block count for new object
+        elif "M625" in line:  # Stop printing object
+            in_object = False
+            if inside_perimeter_block:
+                modified_lines.append(f"G1 Z{current_z:.3f} F1200 ; Reset Z at object end\n")
                 inside_perimeter_block = False
+
+        # Check for layer changes and Z height updates
+        if "; CHANGE_LAYER" in line:
+            z_height = get_z_height_from_comment(lines[line_num + 1]) if line_num + 1 < len(lines) else None
+            if z_height is not None:
+                current_z = z_height
+                current_layer += 1
+                perimeter_block_count = 0
+                logging.info(f"Layer change detected: Z={current_z:.3f}")
+
+        # Handle perimeter detection and Z shifts only when actively printing object
+        if in_object:
+            # Detect wall transitions
+            if "; FEATURE:" in line:
+                # Reset Z height when transitioning between features
+                if inside_perimeter_block:
+                    modified_lines.append(f"G1 Z{current_z:.3f} F1200 ; Reset Z for feature transition\n")
+                    inside_perimeter_block = False
+                
+                if "; FEATURE: Inner wall" in line:
+                    perimeter_type = "internal"
+                    perimeter_found = True
+                elif "; FEATURE: Outer wall" in line:
+                    perimeter_type = "external"
+                    if inside_perimeter_block:
+                        modified_lines.append(f"G1 Z{current_z:.3f} F1200 ; Reset Z for outer wall\n")
+                        inside_perimeter_block = False
+                else:
+                    perimeter_type = None
+
+            # Handle Z shifts for internal perimeters
+            if perimeter_type == "internal" and line.startswith("G1") and "X" in line and "Y" in line:
+                if "E" in line:  # Extrusion move
+                    if not inside_perimeter_block:
+                        perimeter_block_count += 1
+                        inside_perimeter_block = True
+                        
+                        # Apply Z shift for inner wall
+                        adjusted_z = current_z + z_shift
+                        modified_lines.append(f"G1 Z{adjusted_z:.3f} F1200 ; Z shift for inner wall\n")
+                        shifted_blocks += 1
+                        
+                        # Adjust extrusion
+                        e_match = re.search(r'E([-\d.]+)', line)
+                        if e_match:
+                            e_value = float(e_match.group(1))
+                            new_e_value = e_value * extrusion_multiplier
+                            line = re.sub(r'E[-\d.]+', f'E{new_e_value:.5f}', line.strip())
+                            line += f" ; Adjusted E for inner wall\n"
+                
+                elif "F" in line and not "E" in line and inside_perimeter_block:
+                    modified_lines.append(f"G1 Z{current_z:.3f} F1200 ; Reset Z after inner wall\n")
+                    inside_perimeter_block = False
 
         modified_lines.append(line)
 
     if not perimeter_found:
         logging.warning("No internal perimeters found in the file.")
     else:
-        logging.info(f"Processing complete: Modified {shifted_blocks} blocks across {total_layers} layers")
+        logging.info(f"Processing complete: Modified {shifted_blocks} blocks across {current_layer} layers")
 
-    # Overwrite the input file with the modified G-code
     with open(input_file, 'w') as outfile:
         outfile.writelines(modified_lines)
 
