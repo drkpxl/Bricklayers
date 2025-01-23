@@ -18,143 +18,83 @@ import logging
 import os
 import argparse
 
-def detect_printer_type(gcode_lines):
-    """Detect printer type based on G-code features"""
-    logging.info("Starting printer type detection")
-    
-    for i, line in enumerate(gcode_lines):
-        if "; FEATURE:" in line:
-            logging.info(f"Detected Bambu/Orca printer from feature marker in line {i}: {line.strip()}")
-            return "bambu"
-        elif ";TYPE:" in line:
-            logging.info(f"Detected Prusa printer from type marker in line {i}: {line.strip()}")
-            return "prusa"
-    
-    logging.warning("No printer type markers found - defaulting to Prusa")
-    return "prusa"
-
-def get_z_height_from_comment(line):
-    """Extract Z height from comment if present"""
-    if "; Z_HEIGHT:" in line:
-        match = re.search(r'; Z_HEIGHT: ([\d.]+)', line)
-        if match:
-            return float(match.group(1))
-    return None
-
 def process_gcode(input_file, layer_height, extrusion_multiplier):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    log_file_path = os.path.join(script_dir, "z_shift_log.txt")
     logging.basicConfig(
-        filename=log_file_path,
-        filemode="w",
+        filename="brick_layer_log.txt",
         level=logging.INFO,
         format="%(asctime)s - %(message)s"
     )
 
-    current_layer = 0
-    current_z = 0.0
-    perimeter_type = None
-    perimeter_block_count = 0
-    inside_perimeter_block = False
-    z_shift = layer_height * 0.5
-    perimeter_found = False
-    
-    logging.info("Starting G-code processing")
-    logging.info(f"Settings: Layer height={layer_height}mm, Z-shift={z_shift}mm, Extrusion multiplier={extrusion_multiplier}")
-
     with open(input_file, 'r') as infile:
         lines = infile.readlines()
 
-    printer_type = detect_printer_type(lines)
-    logging.info(f"Detected printer type: {printer_type}")
-
+    current_layer = 0
+    current_z = 0.0
+    in_inner_wall = False
+    segment_count = 0
+    last_was_travel = False
     modified_lines = []
-    shifted_blocks = 0
-    in_object = False  # Track if we're inside an object printing section
     
-    for line_num, line in enumerate(lines):
-        # Track object printing sections
-        if "M624" in line:  # Start printing object
-            in_object = True
-            perimeter_block_count = 0  # Reset block count for new object
-        elif "M625" in line:  # Stop printing object
-            in_object = False
-            if inside_perimeter_block:
-                modified_lines.append(f"G1 Z{current_z:.3f} F1200 ; Reset Z at object end\n")
-                inside_perimeter_block = False
-
-        # Check for layer changes and Z height updates
+    for i, line in enumerate(lines):
+        # Layer change detection
         if "; CHANGE_LAYER" in line:
-            z_height = get_z_height_from_comment(lines[line_num + 1]) if line_num + 1 < len(lines) else None
-            if z_height is not None:
-                current_z = z_height
-                current_layer += 1
-                perimeter_block_count = 0
-                logging.info(f"Layer change detected: Z={current_z:.3f}")
+            for next_line in lines[i:i+3]:
+                if "Z_HEIGHT:" in next_line:
+                    z_match = re.search(r'Z_HEIGHT: ([\d.]+)', next_line)
+                    if z_match:
+                        current_z = float(z_match.group(1))
+                        current_layer += 1
+                        segment_count = 0
+                        logging.info(f"Layer {current_layer} at Z={current_z}")
+                    break
 
-        # Handle perimeter detection and Z shifts only when actively printing object
-        if in_object:
-            # Detect wall transitions
-            if "; FEATURE:" in line:
-                # Reset Z height when transitioning between features
-                if inside_perimeter_block:
-                    modified_lines.append(f"G1 Z{current_z:.3f} F1200 ; Reset Z for feature transition\n")
-                    inside_perimeter_block = False
+        # Feature detection
+        if "; FEATURE: Inner wall" in line:
+            in_inner_wall = True
+            segment_count = 0
+            logging.info(f"Inner wall start")
+        elif "; FEATURE:" in line and in_inner_wall:
+            in_inner_wall = False
+            modified_lines.append(f"G1 Z{current_z:.3f} F1200 ; Reset Z\n")
+            logging.info("Feature change - reset Z")
+
+        # Process inner wall moves
+        if in_inner_wall and line.startswith("G1"):
+            is_travel = "F" in line and not "E" in line
+            is_extrusion = "E" in line
+            
+            # New segment starts after a travel move
+            if is_extrusion and last_was_travel:
+                segment_count += 1
+                shift_up = (segment_count + current_layer) % 2 == 1
                 
-                if "; FEATURE: Inner wall" in line:
-                    perimeter_type = "internal"
-                    perimeter_found = True
-                elif "; FEATURE: Outer wall" in line:
-                    perimeter_type = "external"
-                    if inside_perimeter_block:
-                        modified_lines.append(f"G1 Z{current_z:.3f} F1200 ; Reset Z for outer wall\n")
-                        inside_perimeter_block = False
+                if shift_up:
+                    adjusted_z = current_z + layer_height
+                    modified_lines.append(f"G1 Z{adjusted_z:.3f} F1200 ; Shift up\n")
+                    # Modify extrusion
+                    e_match = re.search(r'E([-\d.]+)', line)
+                    if e_match:
+                        e_value = float(e_match.group(1))
+                        new_e_value = e_value * extrusion_multiplier
+                        line = re.sub(r'E[-\d.]+', f'E{new_e_value:.5f}', line.strip())
+                        line += " ; Adjusted extrusion\n"
+                        logging.info(f"Segment {segment_count}: shifted up with adjusted extrusion")
                 else:
-                    perimeter_type = None
-
-            # Handle Z shifts for internal perimeters
-            if perimeter_type == "internal" and line.startswith("G1") and "X" in line and "Y" in line:
-                if "E" in line:  # Extrusion move
-                    if not inside_perimeter_block:
-                        perimeter_block_count += 1
-                        inside_perimeter_block = True
-                        
-                        # Apply Z shift for inner wall
-                        adjusted_z = current_z + z_shift
-                        modified_lines.append(f"G1 Z{adjusted_z:.3f} F1200 ; Z shift for inner wall\n")
-                        shifted_blocks += 1
-                        
-                        # Adjust extrusion
-                        e_match = re.search(r'E([-\d.]+)', line)
-                        if e_match:
-                            e_value = float(e_match.group(1))
-                            new_e_value = e_value * extrusion_multiplier
-                            line = re.sub(r'E[-\d.]+', f'E{new_e_value:.5f}', line.strip())
-                            line += f" ; Adjusted E for inner wall\n"
-                
-                elif "F" in line and not "E" in line and inside_perimeter_block:
-                    modified_lines.append(f"G1 Z{current_z:.3f} F1200 ; Reset Z after inner wall\n")
-                    inside_perimeter_block = False
+                    modified_lines.append(f"G1 Z{current_z:.3f} F1200 ; Base height\n")
+                    logging.info(f"Segment {segment_count}: base height")
+            
+            last_was_travel = is_travel
 
         modified_lines.append(line)
-
-    if not perimeter_found:
-        logging.warning("No internal perimeters found in the file.")
-    else:
-        logging.info(f"Processing complete: Modified {shifted_blocks} blocks across {current_layer} layers")
 
     with open(input_file, 'w') as outfile:
         outfile.writelines(modified_lines)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Post-process G-code for Z-shifting and extrusion adjustments.")
-    parser.add_argument("input_file", help="Path to the input G-code file")
-    parser.add_argument("-layerHeight", type=float, default=0.2, help="Layer height in mm (default: 0.2mm)")
-    parser.add_argument("-extrusionMultiplier", type=float, default=1, help="Extrusion multiplier for first layer (default: 1.5x)")
+    parser = argparse.ArgumentParser(description="Brick Layer G-code processor")
+    parser.add_argument("input_file", help="Input G-code file path")
+    parser.add_argument("-layerHeight", type=float, default=0.2, help="Layer height (mm)")
+    parser.add_argument("-extrusionMultiplier", type=float, default=1.5, help="Extrusion multiplier")
     args = parser.parse_args()
 
-    process_gcode(
-        input_file=args.input_file,
-        layer_height=args.layerHeight,
-        extrusion_multiplier=args.extrusionMultiplier,
-    )
+    process_gcode(args.input_file, args.layerHeight, args.extrusionMultiplier)
